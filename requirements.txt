@@ -3,5 +3,5 @@ requests
 beautifulsoup4
 pdfplumber
 transformers
-pinecone-client
+pinecone
 google-generativeai
