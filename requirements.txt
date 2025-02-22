@@ -5,4 +5,5 @@ pdfplumber
 transformers
 pinecone
 langchain
+langchain-community
 google-generativeai
