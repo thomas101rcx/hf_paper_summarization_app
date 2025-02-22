@@ -1,0 +1,7 @@
+streamlit
+requests
+beautifulsoup4
+pdfplumber
+transformers
+pinecone-client
+google-generativeai
