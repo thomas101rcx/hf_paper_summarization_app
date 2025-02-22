@@ -9,13 +9,6 @@ import requests
 import pdfplumber
 import streamlit as st
 from bs4 import BeautifulSoup
-from email.mime.text import MIMEText
-import smtplib
-# Google Auth / Gmail
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 # Transformers / Embeddings
 from transformers import pipeline
 # Google Generative AI
@@ -23,76 +16,17 @@ import google.generativeai as genai
 # Pinecone
 import pinecone
 from langchain.vectorstores import Pinecone
-# Auth
-from dotenv import load_dotenv
-from auth import Authenticator
-
+from pinecone import ServerlessSpec
 
 ######################################################
 #                      CONFIG                        #
 ######################################################
 
+os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
 
-os.environ["GEMINI_API_KEY"] =st.secrets["GEMINI_API_KEY"]
-os.environ["PINECONE_API_KEY"] =st.secrets["PINECONE_API_KEY"]
-
-
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-
-genai.configure(api_key=os.environ["GEMINI_API_KEY"] )
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 model = genai.GenerativeModel("gemini-2.0-flash-exp")
-
-######################################################
-#                GOOGLE GMAIL AUTH                   #
-######################################################
-
-def authenticate_gmail():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    return creds
-
-######################################################
-#               GMAIL FETCHING HELPERS               #
-######################################################
-
-def extract_links_from_email(raw_data):
-    html_content = requests.utils.unquote(raw_data)
-    soup = BeautifulSoup(html_content, 'html.parser')
-    links = [a['href'] for a in soup.find_all('a', href=True)]
-    return links
-
-def fetch_daily_papers_email(creds, query="Daily papers"):
-    service = build('gmail', 'v1', credentials=creds)
-    query = f"{query} from:daily_papers_digest@notifications.huggingface.co"
-    results = service.users().messages().list(userId='me', q=query).execute()
-    messages = results.get('messages', [])
-    if not messages:
-        return None
-    # Take the most recent email
-    email_id = messages[0]['id']
-    message = service.users().messages().get(userId='me', id=email_id).execute()
-    payload = message['payload']
-    parts = payload.get('parts', [])
-    if not parts:
-        data = payload['body']['data']
-        html = base64.urlsafe_b64decode(data).decode()
-        return html
-    for part in parts:
-        if part['mimeType'] == 'text/html':
-            data = part['body']['data']
-            html = base64.urlsafe_b64decode(data).decode()
-            return html
-    return None
 
 ######################################################
 #          PDF EXTRACTION & SUMMARIZATION            #
@@ -139,7 +73,6 @@ def extract_text_from_pdf_in_memory(pdf_url):
 
 def summarize_text(text):
     """Use Gemini-2.0-flash-exp to generate a concise summary."""
-
     current_dateTime = datetime.now().strftime("%Y %B %d")
     prompt = (
         f"Summarize the following paper for a Data Scientist to quickly "
@@ -148,6 +81,33 @@ def summarize_text(text):
     )
     response = model.generate_content(contents=prompt)
     return response.text
+
+######################################################
+#               FETCH DAILY PAPERS                   #
+######################################################
+
+def fetch_daily_papers_from_website(date_str):
+    """Fetch daily papers from Hugging Face website for a specific date."""
+    url = f"https://huggingface.co/papers?date={date_str}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Failed to fetch {url}. Status code: {response.status_code}")
+            return []
+        soup = BeautifulSoup(response.text, 'html.parser')
+        paper_cards = soup.find_all('div', class_='paper-card')
+        links = []
+        for card in paper_cards:
+            a_tag = card.find('a', href=True)
+            if a_tag:
+                link = a_tag['href']
+                if not link.startswith('http'):
+                    link = requests.compat.urljoin("https://huggingface.co", link)
+                links.append(link)
+        return links
+    except Exception as e:
+        print(f"Error while fetching papers from {url}: {e}")
+        return []
 
 ######################################################
 #                      MEMO CREATION                 #
@@ -174,30 +134,6 @@ def generate_memo(paper_summaries):
     return response.text
 
 ######################################################
-#                  EMAIL SENDING                     #
-######################################################
-
-def send_email(recipient, subject, body):
-    """
-    Example function for sending your memo via email.
-    Make sure to replace with your valid credentials.
-    """
-    try:
-        sender_email = "your_email@gmail.com"
-        app_password = "your_app_password"
-        message = MIMEText(body, "plain")
-        message["Subject"] = subject
-        message["From"] = sender_email
-        message["To"] = recipient
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, app_password)
-            server.sendmail(sender_email, recipient, message.as_string())
-        print("Email sent successfully.")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-
-######################################################
 #                 PINECONE SETUP                     #
 ######################################################
 
@@ -205,12 +141,12 @@ pinecone = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 index_name = "ai-daily-papers"
 
 # Create the index if not exists (dimensions = 512 for jina-embeddings-v2-small-en)
-index_name = "ai-daily-papers"
 if index_name not in pinecone.list_indexes()[0]['name']:
-    pinecone.create_index(name=index_name, dimension=512,spec=ServerlessSpec(
-            cloud = "aws",
-      region = "us-east-1",
-   ) )
+    pinecone.create_index(
+        name=index_name,
+        dimension=512,
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
 index = pinecone.Index(index_name)
 
 embedding_model = pipeline(
@@ -245,8 +181,8 @@ def load_all_items_from_pinecone() -> List[Dict[str, Any]]:
     # blank filter => get everything
     results = index.query(
         vector=dummy_vector,
-        filter={},  
-        top_k=1000,  
+        filter={},
+        top_k=1000,
         include_metadata=True
     )
     items = []
@@ -335,10 +271,9 @@ def main():
     # 5. Show the main chat interface for the selected date
     main_chat_ui()
 
-
 def check_and_generate_memo_for_today():
     """
-    Fetch daily papers from email, generate memo if not existing for today.
+    Fetch daily papers from Hugging Face website, generate memo if not existing for today.
     If we already have today's memo in Pinecone, do nothing.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -357,13 +292,8 @@ def check_and_generate_memo_for_today():
     if results and "matches" in results and len(results["matches"]) > 0:
         return  # Already have today's memo
 
-    # If no daily memo for today, try to fetch from Gmail
-    creds = authenticate_gmail()
-    email_content = fetch_daily_papers_email(creds)
-    if not email_content:
-        return
-
-    links = extract_links_from_email(email_content)
+    # Fetch papers from Hugging Face website
+    links = fetch_daily_papers_from_website(today_str)
     if not links:
         return
 
@@ -407,7 +337,6 @@ def check_and_generate_memo_for_today():
         }
         store_in_pinecone(text=paper["summary"], metadata=paper_metadata)
 
-
 def sidebar_ui():
     """
     Renders the sidebar. We show the available dates for which we have data (memo/chats).
@@ -427,12 +356,11 @@ def sidebar_ui():
     if "selected_date" not in st.session_state:
         st.session_state["selected_date"] = all_dates[0]  # default to the newest
 
-    chosen_date = st.sidebar.selectbox("Select a date:", all_dates, 
+    chosen_date = st.sidebar.selectbox("Select a date:", all_dates,
                                        index=all_dates.index(st.session_state["selected_date"]))
 
     # Update the session state
     st.session_state["selected_date"] = chosen_date
-
 
 def main_chat_ui():
     """
@@ -513,8 +441,6 @@ def main_chat_ui():
         # Optionally force a rerun so the user doesn't see the prompt repeated in the input
         st.rerun()
 
-
-
 def build_conversation_prompt(memo_text: str, chats: List[Dict[str, Any]]) -> str:
     """
     Build a single prompt for the LLM from the day's memo + prior Q&A.
@@ -530,7 +456,6 @@ def build_conversation_prompt(memo_text: str, chats: List[Dict[str, Any]]) -> st
         prompt += f"User: {question}\nAssistant: {answer}\n"
 
     return prompt
-
 
 ######################################################
 #                     RUN APP                        #
