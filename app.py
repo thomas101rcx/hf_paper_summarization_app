@@ -4,8 +4,9 @@ import requests
 import pdfplumber
 import io
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-import streamlit as st
+# Transformers / Embeddings
+from transformers import pipeline
+# Google Generative AI
 import google.generativeai as genai
 from transformers import pipeline
 from pinecone import Pinecone, ServerlessSpec
@@ -31,7 +32,75 @@ if INDEX_NAME not in [idx["name"] for idx in pinecone_client.list_indexes()]:
     pinecone_client.create_index(
         name=INDEX_NAME, dimension=512, spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
-index = pinecone_client.Index(INDEX_NAME)
+    response = model.generate_content(contents=prompt)
+    return response.text
+
+######################################################
+#               FETCH DAILY PAPERS                   #
+######################################################
+
+def fetch_daily_papers_from_website(date_str):
+    """Fetch daily papers from Hugging Face website for a specific date."""
+    url = f"https://huggingface.co/papers?date={date_str}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Failed to fetch {url}. Status code: {response.status_code}")
+            return []
+        soup = BeautifulSoup(response.text, 'html.parser')
+        paper_cards = soup.find_all('div', class_='paper-card')
+        links = []
+        for card in paper_cards:
+            a_tag = card.find('a', href=True)
+            if a_tag:
+                link = a_tag['href']
+                if not link.startswith('http'):
+                    link = requests.compat.urljoin("https://huggingface.co", link)
+                links.append(link)
+        return links
+    except Exception as e:
+        print(f"Error while fetching papers from {url}: {e}")
+        return []
+
+######################################################
+#                      MEMO CREATION                 #
+######################################################
+
+def generate_memo(paper_summaries):
+    """
+    Generate a one-page daily memo that includes clickable links in Markdown format.
+    Expects a list of dicts like: [{'link': ..., 'summary': ...}, ...]
+    """
+    combined_text = ""
+    for paper in paper_summaries:
+        combined_text += (
+            f"{paper['summary']}\nLink: {paper['link']}\n******\n"
+        )
+
+    prompt = (
+        "Generate a one-page daily memo based on the following summaries of various AI/ML papers. "
+        "Each summary is separated by \"******\". After each summary, include the link as a Markdown "
+        "hyperlink `[Paper Link](<url>)`. Keep it concise.\n\n"
+        f"{combined_text}"
+    )
+    response = model.generate_content(contents=prompt)
+    return response.text
+
+######################################################
+#                 PINECONE SETUP                     #
+######################################################
+
+pinecone = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index_name = "ai-daily-papers"
+
+# Create the index if not exists (dimensions = 512 for jina-embeddings-v2-small-en)
+if index_name not in pinecone.list_indexes()[0]['name']:
+    pinecone.create_index(
+        name=index_name,
+        dimension=512,
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+index = pinecone.Index(index_name)
 
 # Embedding model for Pinecone
 embedding_model = pipeline(
@@ -158,12 +227,46 @@ def group_by_date(items: list[dict]) -> dict:
 #                 STREAMLIT APP                      #
 ######################################################
 
-def check_and_generate_memo(today: str) -> None:
-    """Generate and store memo for today if it doesn’t exist."""
-    if index.query(vector=[0.0] * 512, filter={"type": "daily_memo", "date": today}, top_k=1).get("matches"):
-        return
-    
-    links = fetch_daily_papers(today)
+def main():
+    # 1. Possibly generate today's memo if we haven't yet.
+    check_and_generate_memo_for_today()
+
+    # 2. Load all items from Pinecone and group them by date
+    all_items = load_all_items_from_pinecone()
+    data_by_date = group_data_by_date(all_items)
+
+    # 3. Store in session_state
+    st.session_state["data_by_date"] = data_by_date
+
+    # 4. Build the sidebar to select which date's conversation we want
+    sidebar_ui()
+
+    # 5. Show the main chat interface for the selected date
+    main_chat_ui()
+
+def check_and_generate_memo_for_today():
+    """
+    Fetch daily papers from Hugging Face website, generate memo if not existing for today.
+    If we already have today's memo in Pinecone, do nothing.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Check if today's memo already exists in Pinecone
+    dummy_vector = [0.0] * 512
+    filter_query = {"type": "daily_memo", "date": today_str}
+    results = index.query(
+        vector=dummy_vector,
+        filter=filter_query,
+        top_k=1,
+        include_metadata=True
+    )
+
+    # If we find a daily_memo for today, do nothing
+    if results and "matches" in results and len(results["matches"]) > 0:
+        return  # Already have today's memo
+
+    # Fetch papers from Hugging Face website
+    links = fetch_daily_papers_from_website(today_str)
     if not links:
         return
     
@@ -180,8 +283,51 @@ def check_and_generate_memo(today: str) -> None:
             "timestamp": datetime.now().isoformat(), "content": memo
         })
 
-def sidebar_ui(data_by_date: dict) -> None:
-    """Render sidebar with date selection."""
+    paper_summaries = []
+    for link in links:
+        pdf_url = get_pdf_link(link)
+        if not pdf_url:
+            continue
+        text = extract_text_from_pdf_in_memory(pdf_url)
+        if not text:
+            continue
+        summary = summarize_text(text)
+        paper_summaries.append({"link": link, "summary": summary})
+
+    if not paper_summaries:
+        return
+
+    # Generate daily memo
+    memo_text = generate_memo(paper_summaries)
+
+    # Store the daily memo in Pinecone
+    memo_id = f"memo-{today_str}"
+    memo_metadata = {
+        "id": memo_id,
+        "type": "daily_memo",
+        "date": today_str,
+        "timestamp": datetime.now().isoformat(),
+        "content": memo_text
+    }
+    store_in_pinecone(text=memo_text, metadata=memo_metadata)
+
+    # Optional: store the paper summaries as well
+    for paper in paper_summaries:
+        paper_metadata = {
+            "id": paper["link"],
+            "type": "paper_summary",
+            "date": today_str,
+            "timestamp": datetime.now().isoformat(),
+            "summary": paper["summary"],
+            "link": paper["link"]
+        }
+        store_in_pinecone(text=paper["summary"], metadata=paper_metadata)
+
+def sidebar_ui():
+    """
+    Renders the sidebar. We show the available dates for which we have data (memo/chats).
+    The user picks a date to see/resume that day's conversation in the main area.
+    """
     st.sidebar.title("Conversation Dates")
     if not data_by_date:
         st.sidebar.write("No data found.")
