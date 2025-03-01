@@ -9,6 +9,8 @@ import requests
 import pdfplumber
 import streamlit as st
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from urllib.parse import urlparse
 # Transformers / Embeddings
 from transformers import pipeline
 # Google Generative AI
@@ -86,28 +88,116 @@ def summarize_text(text):
 #               FETCH DAILY PAPERS                   #
 ######################################################
 
-def fetch_daily_papers_from_website(date_str):
-    """Fetch daily papers from Hugging Face website for a specific date."""
+
+# def fetch_daily_papers_from_website(date_str):
+#     """Fetch daily papers from Hugging Face website for a specific date."""
+
+#     url = f"https://huggingface.co/papers?date={date_str}"
+#     print(f"Fetching papers for {date_str} from {url}")
+#     try:
+#         response = requests.get(url)
+#         if response.status_code != 200:
+#             print(f"Failed to fetch {url}. Status code: {response.status_code}")
+#             return []
+#         soup = BeautifulSoup(response.text, 'html.parser')
+#         links = soup.find_all('a', href = True)
+#         base_url = "https://huggingface.co"
+#         paper_links = set()
+#         for link in links:
+#             href = link["href"]
+#             if href.startswith("/papers/"):  # Adjust this condition based on actual link patterns
+#                 full_url = urljoin(base_url, href)
+#                 paper_links.add(full_url)
+#         print(paper_links)
+#         unique_links_list = list(paper_links)
+#         filtered_links = [
+#             link for link in unique_links_list
+#             if not "#community" in link
+#         ]
+#         print(filtered_links)
+#         print(f"Found {len(filtered_links)} paper links for {date_str}")
+#         return filtered_links
+#     except Exception as e:
+#         print(f"Error fetching papers from {url}: {e}")
+#         return []
+
+
+def fetch_daily_papers_from_website(date_str, top_n=10):
+    """Fetch the top N most popular papers from Hugging Face for a specific date.
+
+    Args:
+        date_str (str): Date in 'YYYY-MM-DD' format (e.g., '2025-02-24').
+        top_n (int): Number of top papers to return (default: 15).
+
+    Returns:
+        list: List of URLs for the top N papers, sorted by popularity (upvotes).
+    """
+    # Construct the URL
     url = f"https://huggingface.co/papers?date={date_str}"
+    base_url = "https://huggingface.co"
+    # print(f"Fetching papers for {date_str} from {url}")
+
     try:
+        # Fetch the page
         response = requests.get(url)
         if response.status_code != 200:
-            print(f"Failed to fetch {url}. Status code: {response.status_code}")
+            # print(f"Failed to fetch {url}. Status code: {response.status_code}")
             return []
+
+        # Parse the HTML content
         soup = BeautifulSoup(response.text, 'html.parser')
-        paper_cards = soup.find_all('div', class_='paper-card')
-        links = []
-        for card in paper_cards:
-            a_tag = card.find('a', href=True)
-            if a_tag:
-                link = a_tag['href']
-                if not link.startswith('http'):
-                    link = requests.compat.urljoin("https://huggingface.co", link)
-                links.append(link)
-        return links
+
+        # Find all paper title elements (assuming titles are in <h3> tags)
+        title_elements = soup.find_all('h3')
+
+        papers_data = []
+        for title_elem in title_elements:
+            # Extract the title
+            title = title_elem.get_text(strip=True)
+
+            # Extract the link (assuming the <h3> tag contains or is near an <a> tag)
+            link_elem = title_elem.find_parent('a') or title_elem.find('a')
+            if not link_elem or not link_elem.get('href'):
+                continue  # Skip if no link is found
+            href = link_elem["href"]
+            if href.startswith("/papers/"):  # Filter for paper links
+                full_url = urljoin(base_url, href)
+                if "#community" in full_url:  # Skip community links
+                    continue
+
+                # Extract upvote count (assuming it’s a numeric text before the title)
+                upvote_text = None
+                prev_elem = title_elem.find_previous(string=re.compile(r'^\d+$'))
+                if prev_elem:
+                    upvote_text = prev_elem.strip()
+                upvotes = int(upvote_text) if upvote_text and upvote_text.isdigit() else 0
+
+                # Store the data
+                papers_data.append({"Title": title, "URL": full_url, "Upvotes": upvotes})
+
+        if not papers_data:
+            # print("No valid paper links found. Check the HTML structure.")
+            return []
+
+        # Convert to DataFrame and sort by upvotes (descending)
+        df_papers = pd.DataFrame(papers_data)
+        df_sorted = df_papers.sort_values(by="Upvotes", ascending=False)
+
+        # Get the top N papers
+        top_papers = df_sorted.head(top_n)
+        top_links = top_papers["URL"].tolist()
+
+        # Output some info
+        # print(f"Found {len(papers_data)} total papers, returning top {len(top_links)} by popularity:")
+        # print(top_papers[["Title", "Upvotes"]].to_string(index=False))
+        # print(f"Top {top_n} paper URLs: {top_links}")
+
+        return top_links
+
     except Exception as e:
-        print(f"Error while fetching papers from {url}: {e}")
+        print(f"Error fetching papers from {url}: {e}")
         return []
+
 
 ######################################################
 #                      MEMO CREATION                 #
@@ -271,14 +361,15 @@ def main():
     # 5. Show the main chat interface for the selected date
     main_chat_ui()
 
+# Updated Memo Generation Logic
 def check_and_generate_memo_for_today():
     """
-    Fetch daily papers from Hugging Face website, generate memo if not existing for today.
-    If we already have today's memo in Pinecone, do nothing.
+    Fetch daily papers from Hugging Face website and generate a memo for today if it doesn’t exist.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"Checking memo for {today_str}")
 
-    # Check if today's memo already exists in Pinecone
+    # Check Pinecone for an existing memo for today
     dummy_vector = [0.0] * 512
     filter_query = {"type": "daily_memo", "date": today_str}
     results = index.query(
@@ -287,16 +378,26 @@ def check_and_generate_memo_for_today():
         top_k=1,
         include_metadata=True
     )
-
-    # If we find a daily_memo for today, do nothing
+    memo_exists = False
     if results and "matches" in results and len(results["matches"]) > 0:
-        return  # Already have today's memo
+        memo_exists = True
+        existing_memo = results["matches"][0]["metadata"]
+        print(f"Found existing memo for {today_str}: {existing_memo.get('content', '')[:100]}...")
+    else:
+        print(f"No memo found for {today_str} in Pinecone")
 
-    # Fetch papers from Hugging Face website
-    links = fetch_daily_papers_from_website(today_str)
-    if not links:
+    # If memo exists, skip generation (remove this condition to force regeneration for testing)
+    if memo_exists:
+        print("Skipping memo generation as one already exists")
         return
 
+    # Fetch papers from Hugging Face
+    links = fetch_daily_papers_from_website(today_str, top_n=10)
+    if not links:
+        print(f"No papers found for {today_str}. Aborting memo generation.")
+        return
+
+    # Generate summaries
     paper_summaries = []
     for link in links:
         pdf_url = get_pdf_link(link)
@@ -309,12 +410,11 @@ def check_and_generate_memo_for_today():
         paper_summaries.append({"link": link, "summary": summary})
 
     if not paper_summaries:
+        print(f"No valid summaries generated for {today_str}. Aborting.")
         return
 
-    # Generate daily memo
+    # Generate and store memo
     memo_text = generate_memo(paper_summaries)
-
-    # Store the daily memo in Pinecone
     memo_id = f"memo-{today_str}"
     memo_metadata = {
         "id": memo_id,
@@ -324,18 +424,7 @@ def check_and_generate_memo_for_today():
         "content": memo_text
     }
     store_in_pinecone(text=memo_text, metadata=memo_metadata)
-
-    # Optional: store the paper summaries as well
-    for paper in paper_summaries:
-        paper_metadata = {
-            "id": paper["link"],
-            "type": "paper_summary",
-            "date": today_str,
-            "timestamp": datetime.now().isoformat(),
-            "summary": paper["summary"],
-            "link": paper["link"]
-        }
-        store_in_pinecone(text=paper["summary"], metadata=paper_metadata)
+    print(f"Memo for {today_str} generated and stored successfully")
 
 def sidebar_ui():
     """
