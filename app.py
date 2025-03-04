@@ -19,6 +19,7 @@ import google.generativeai as genai
 import pinecone
 from langchain.vectorstores import Pinecone
 from pinecone import ServerlessSpec
+import pandas as pd
 
 ######################################################
 #                      CONFIG                        #
@@ -107,7 +108,7 @@ def fetch_daily_papers_from_website(date_str, top_n=10):
         # Fetch the page
         response = requests.get(url)
         if response.status_code != 200:
-            # print(f"Failed to fetch {url}. Status code: {response.status_code}")
+            print(f"Failed to fetch {url}. Status code: {response.status_code}")
             return []
 
         # Parse the HTML content
@@ -142,7 +143,7 @@ def fetch_daily_papers_from_website(date_str, top_n=10):
                 papers_data.append({"Title": title, "URL": full_url, "Upvotes": upvotes})
 
         if not papers_data:
-            # print("No valid paper links found. Check the HTML structure.")
+            print("No valid paper links found. Check the HTML structure.")
             return []
 
         # Convert to DataFrame and sort by upvotes (descending)
