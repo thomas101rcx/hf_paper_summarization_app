@@ -8,3 +8,4 @@ langchain
 torch
 langchain-community
 google-generativeai
+pandas
